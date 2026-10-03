@@ -18,12 +18,15 @@
 #   7. Upload schemas as artifacts    - saves generated schemas as a downloadable workflow artifact
 #   8. Create release assets          - attaches schema JSON files to the GitHub release (pre-release and release)
 #   9. Resolve schema organization    - selects test.ad or sage.schemas.ad based on trigger event
-#  10. Register schemas in Synapse    - registers schemas in the resolved org; uses release tag as semantic version
+#  10. Register schemas in Synapse    - registers each schema in the resolved org; uses release tag as semantic version.
+#                                       A schema that fails is logged and skipped so the rest still register
 #  11. Create recordsets              - for each registered schema, creates a RecordSet in the Synapse project
-#                                       (versioned folder per release; single overwritten folder per PR)
-#  12. Format Schema Report           - builds a markdown summary of generated/registered schemas
+#                                       (versioned folder per release; single overwritten folder per PR).
+#                                       A schema that fails is logged and skipped
+#  12. Format Schema Report           - builds a markdown summary of generated/registered schemas, including failures
 #  13. Comment PR with Schema Summary - posts the report as a PR comment
-#  14. Report status check            - posts a check run to the bot's new commit SHA (if CSV was updated)
+#  14. Fail if any schema failed      - fails the job at the end if any schema failed to register or get a RecordSet
+#  15. Report status check            - posts a check run to the bot's new commit SHA (if CSV was updated)
 #                                       or the original PR head SHA, so branch protection is never left pending
 #
 # Required secrets:
@@ -70,6 +73,9 @@ jobs:
 
     env: 
       RECORDSET_FOLDER_ID: syn74847000
+      # Per-schema failures (stage<TAB>schema<TAB>error), collected so one failing
+      # schema doesn't stop the others; checked at the end of the job.
+      SCHEMA_FAILURES_FILE: ${{ github.workspace }}/../schema-failures.tsv
     steps:
       - uses: actions/checkout@v6
         with:
@@ -81,7 +87,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip3 install "pandas>=1.3.1"
+        run: pip3 install "pandas>=1.3.1" "synapseclient[curator]"
 
       - name: assemble csv data model
         run: python scripts/assemble_csv_data_model.py modules AD.model.csv
@@ -179,21 +185,62 @@ jobs:
             echo "🧪 Test: deploying to test.ad"
           fi
 
+      # Registers each schema on its own (instead of Sage-Bionetworks-Actions/register-jsonschema,
+      # which exits on the first failure) so one bad schema doesn't block the rest.
       - name: Register schemas in Synapse
         id: register
-        uses: Sage-Bionetworks-Actions/register-jsonschema@0.1.0
-        with:
-          org-name: ${{ steps.resolve-org.outputs.org-name }}
-          schema-dir: ${{ steps.generate.outputs.schemas }}
-          synapse-auth-token: ${{ secrets.SYNAPSE_TOKEN_DPE }}
-          version: ${{ github.event.release.tag_name }}
-          fix-schema-name: true
+        env:
+          SYNAPSE_AUTH_TOKEN: ${{ secrets.SYNAPSE_TOKEN_DPE }}
+          SCHEMAS_PATH: ${{ steps.resolve-schemas-path.outputs.path }}
+          ORG_NAME: ${{ steps.resolve-org.outputs.org-name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PYTHON'
+          import os
+          from pathlib import Path
+          from synapseclient import Synapse
+          from synapseclient.extensions.curator import register_jsonschema
+
+          syn = Synapse()
+          syn.login()
+
+          org_name = os.environ["ORG_NAME"]
+          version = os.environ.get("RELEASE_TAG", "").removeprefix("v") or None
+
+          uris = []
+          failures = []
+          for json_file in sorted(Path(os.environ["SCHEMAS_PATH"]).glob("*.json")):
+              schema_name = json_file.stem
+              try:
+                  schema = register_jsonschema(
+                      schema_path=str(json_file),
+                      organization_name=org_name,
+                      schema_name=schema_name,
+                      schema_version=version,
+                      synapse_client=syn,
+                      fix_schema_name=True,
+                  )
+              except Exception as e:
+                  error = " ".join(str(e).split())
+                  print(f"::error::{json_file.name}: failed to register: {error}")
+                  failures.append(f"register\t{schema_name}\t{error}\n")
+                  continue
+              print(f"Registered {schema.uri}")
+              uris.append(schema.uri)
+
+          with open(os.environ["SCHEMA_FAILURES_FILE"], "a") as f:
+              f.writelines(failures)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("uris<<EOF\n" + "\n".join(uris) + "\nEOF\n")
+
+          print(f"Registered {len(uris)} schema(s), {len(failures)} failed")
+          PYTHON
 
       - name: Create recordsets and bind schema
         env:
           SYNAPSE_AUTH_TOKEN: ${{ secrets.SYNAPSE_TOKEN_DPE }}
         run: |
-          pip install synapseclient -q
           python - <<'PYTHON'
           import os 
           from synapseclient import Synapse
@@ -209,45 +256,56 @@ jobs:
           org_name = r'''${{ steps.resolve-org.outputs.org-name }}'''
           release_tag = r'''${{ github.event.release.tag_name }}'''
 
+          failures = []
           for schema_uri in json_schema_uris.splitlines():
               schema_uri = schema_uri.strip()
+              if not schema_uri:
+                  continue
+              # Log and skip a failing schema so the remaining RecordSets are still created
+              try:
+                  # Strip the org prefix to get "SchemaName" (PR) or "SchemaName-1.0.0" (release),
+                  # then take the first segment to isolate just the schema name.
+                  data_type = schema_uri.removeprefix(f"{org_name}-").split("-")[0]
 
-              # Strip the org prefix to get "SchemaName" (PR) or "SchemaName-1.0.0" (release),
-              # then take the first segment to isolate just the schema name.
-              data_type = schema_uri.removeprefix(f"{org_name}-").split("-")[0]
+                  # Fetch the schema columns from Synapse to use as the RecordSet structure
+                  template_df = extract_schema_properties_from_web(syn, schema_uri)
 
-              # Fetch the schema columns from Synapse to use as the RecordSet structure
-              template_df = extract_schema_properties_from_web(syn, schema_uri)
+                  if release_tag:
+                      # For versioned releases, include the semver in the folder name so each
+                      # release gets its own folder (e.g. "individual_human_template_1.0.0")
+                      semver = release_tag.lstrip('v')
+                      tmp_path = f"/tmp/{data_type}_{semver}.csv"
+                      template_df.to_csv(tmp_path, index=False)
+                      folder = Folder(name=f"{data_type}_{semver}", parent_id=recordset_folder_id).store()
+                      record_set = RecordSet(
+                          name="Template",
+                          description=f"Template for {data_type}",
+                          parent_id=folder.id,
+                          path=tmp_path,
+                          upsert_keys=[""],
+                          version_label=semver,
+                          force_version=False,
+                      ).store(synapse_client=syn)
+                  else:
+                      # For PR runs, create/overwrite a single unversioned folder
+                      folder = Folder(name=f"{data_type}", parent_id=recordset_folder_id).store()
+                      tmp_path = f"/tmp/{data_type}.csv"
+                      template_df.to_csv(tmp_path, index=False)
+                      record_set = RecordSet(
+                          name="Template",
+                          description=f"Template for {data_type}",
+                          parent_id=folder.id,
+                          path=tmp_path,
+                          upsert_keys=[""]
+                      ).store(synapse_client=syn)
+                  record_set.bind_schema(json_schema_uri=schema_uri)
+              except Exception as e:
+                  error = " ".join(str(e).split())
+                  print(f"::error::{schema_uri}: failed to create RecordSet: {error}")
+                  failures.append(f"recordset\t{schema_uri}\t{error}\n")
 
-              if release_tag:
-                  # For versioned releases, include the semver in the folder name so each
-                  # release gets its own folder (e.g. "individual_human_template_1.0.0")
-                  semver = release_tag.lstrip('v')
-                  tmp_path = f"/tmp/{data_type}_{semver}.csv"
-                  template_df.to_csv(tmp_path, index=False)
-                  folder = Folder(name=f"{data_type}_{semver}", parent_id=recordset_folder_id).store()
-                  record_set = RecordSet(
-                      name="Template",
-                      description=f"Template for {data_type}",
-                      parent_id=folder.id,
-                      path=tmp_path,
-                      upsert_keys=[""],
-                      version_label=semver,
-                      force_version=False,
-                  ).store(synapse_client=syn)
-              else:
-                  # For PR runs, create/overwrite a single unversioned folder
-                  folder = Folder(name=f"{data_type}", parent_id=recordset_folder_id).store()
-                  tmp_path = f"/tmp/{data_type}.csv"
-                  template_df.to_csv(tmp_path, index=False)
-                  record_set = RecordSet(
-                      name="Template",
-                      description=f"Template for {data_type}",
-                      parent_id=folder.id,
-                      path=tmp_path,
-                      upsert_keys=[""]
-                  ).store(synapse_client=syn)
-              record_set.bind_schema(json_schema_uri=schema_uri)
+          with open(os.environ["SCHEMA_FAILURES_FILE"], "a") as f:
+              f.writelines(failures)
           PYTHON
 
       - name: Format Schema Report
@@ -322,6 +380,22 @@ jobs:
                       report += f"<details>\n<summary><strong>{schema.name}</strong></summary>\n\n"
                       report += render_properties(schema_dict)
                       report += "\n</details>\n\n"
+
+          failures_file = Path(os.environ["SCHEMA_FAILURES_FILE"])
+          failures = [
+              line.split("\t", 2)
+              for line in (failures_file.read_text().splitlines() if failures_file.exists() else [])
+              if line.strip()
+          ]
+          if failures:
+              report += f"## ⚠️ Failed Schemas ({len(failures)})\n\n"
+              report += "| Stage | Schema | Error |\n"
+              report += "|-------|--------|-------|\n"
+              for stage, name, error in failures:
+                  error = error.replace("|", "\\|")
+                  report += f"| {stage} | `{name}` | {error} |\n"
+              report += "\n"
+
           # Write to file
           with open('schema-report.md', 'w') as f:
               f.write(report)
@@ -339,6 +413,16 @@ jobs:
         with:
           message-path: schema-report.md
           message-id: jsonschema-generation
+
+      # Schema failures were logged and skipped so the others could finish;
+      # fail the job here so they're still visible.
+      - name: Fail if any schema failed
+        run: |
+          if [[ -s "$SCHEMA_FAILURES_FILE" ]]; then
+            echo "::error::$(wc -l < "$SCHEMA_FAILURES_FILE") schema step(s) failed:"
+            cat "$SCHEMA_FAILURES_FILE"
+            exit 1
+          fi
 
       - name: Report status check
         if: always() && github.event_name == 'pull_request'
